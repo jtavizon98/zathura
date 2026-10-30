@@ -909,8 +909,14 @@ bool zathura_renderer_load_page(ZathuraRenderer* renderer, zathura_page_t* page)
 
 /* render a page synchronously and return its surface */
 cairo_surface_t* zathura_renderer_render_page(ZathuraRenderer* renderer, zathura_page_t* page) {
+  return zathura_renderer_render_page_scaled(renderer, page, 1.0);
+}
+
+/* render a page synchronously at factor times the current zoom and return its surface */
+cairo_surface_t* zathura_renderer_render_page_scaled(ZathuraRenderer* renderer, zathura_page_t* page, double factor) {
   g_return_val_if_fail(ZATHURA_IS_RENDERER(renderer), NULL);
   g_return_val_if_fail(page != NULL, NULL);
+  g_return_val_if_fail(factor > 0, NULL);
 
   ZathuraRendererPrivate* priv = zathura_renderer_get_instance_private(renderer);
   zathura_document_t* document = zathura_page_get_document(page);
@@ -921,11 +927,11 @@ cairo_surface_t* zathura_renderer_render_page(ZathuraRenderer* renderer, zathura
   }
 
   unsigned int page_width = 0, page_height = 0;
-  const double real_scale = page_calc_height_width(document, page, &page_height, &page_width, false);
+  const double real_scale = page_calc_height_width(document, page, &page_height, &page_width, false) * factor;
 
   const zathura_device_factors_t device_factors = zathura_document_get_device_factors(document);
-  page_width *= device_factors.x;
-  page_height *= device_factors.y;
+  page_width                                    = round(page_width * factor) * device_factors.x;
+  page_height                                   = round(page_height * factor) * device_factors.y;
 
   const cairo_format_t format = priv->recolor.enabled ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_RGB24;
   cairo_surface_t* surface    = cairo_image_surface_create(format, page_width, page_height);
@@ -941,7 +947,9 @@ cairo_surface_t* zathura_renderer_render_page(ZathuraRenderer* renderer, zathura
   }
 
   if (priv->recolor.enabled == true) {
-    recolor(priv, page, page_width, page_height, surface, device_factors);
+    /* recolor() places the images it keeps at the current zoom, so scale them by factor as well */
+    const zathura_device_factors_t image_factors = {device_factors.x * factor, device_factors.y * factor};
+    recolor(priv, page, page_width, page_height, surface, image_factors);
   }
 
   return surface;

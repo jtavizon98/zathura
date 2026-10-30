@@ -69,6 +69,14 @@ typedef struct zathura_page_widget_private_s {
     bool draw;           /**< True if links should be drawn */
   } signatures;
 
+  struct {
+    zathura_link_t* link; /**< Link that the preview belongs to */
+    GtkWidget* widget;    /**< Cached tooltip content for that link */
+    guint timeout_id;     /**< Pending render of the preview */
+    int max_width;        /**< Size limits the preview was made for */
+    int max_height;
+  } link_preview;
+
   GtkWidget* drawing_area;           /**< child layer that draws the page */
   GtkWidget* image_popover;          /**< lazily created image context menu */
   GSimpleActionGroup* image_actions; /**< action group for the image popup */
@@ -92,6 +100,8 @@ static void cb_zathura_page_widget_button_release_event(GtkGestureClick* gesture
 static void cb_zathura_page_widget_motion_notify(GtkEventControllerMotion* controller, gdouble x, gdouble y,
                                                  gpointer data);
 static void cb_zathura_page_widget_leave_notify(GtkEventControllerMotion* controller, gpointer data);
+static gboolean cb_zathura_page_widget_query_tooltip(GtkWidget* widget, int x, int y, gboolean keyboard_mode,
+                                                     GtkTooltip* tooltip, gpointer data);
 static void cb_update_surface(ZathuraRenderRequest* request, cairo_surface_t* surface, void* data);
 static void cb_cache_added(ZathuraRenderRequest* request, void* data);
 static void cb_cache_invalidated(ZathuraRenderRequest* request, void* data);
@@ -233,6 +243,12 @@ static void zathura_page_widget_init(ZathuraPageWidget* widget) {
   priv->signatures.retrieved = false;
   priv->signatures.draw      = false;
 
+  priv->link_preview.link       = NULL;
+  priv->link_preview.widget     = NULL;
+  priv->link_preview.timeout_id = 0;
+  priv->link_preview.max_width  = 0;
+  priv->link_preview.max_height = 0;
+
   /* page is drawn into a child drawing area */
   priv->drawing_area = gtk_drawing_area_new();
   gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(priv->drawing_area), cb_page_draw, widget, NULL);
@@ -248,6 +264,9 @@ static void zathura_page_widget_init(ZathuraPageWidget* widget) {
   g_signal_connect(motion, "motion", G_CALLBACK(cb_zathura_page_widget_motion_notify), widget);
   g_signal_connect(motion, "leave", G_CALLBACK(cb_zathura_page_widget_leave_notify), widget);
   gtk_widget_add_controller(GTK_WIDGET(widget), motion);
+
+  gtk_widget_set_has_tooltip(GTK_WIDGET(widget), TRUE);
+  g_signal_connect(widget, "query-tooltip", G_CALLBACK(cb_zathura_page_widget_query_tooltip), NULL);
 
   /* image popup actions are looked up by the popover via the image prefix */
   static const GActionEntry image_action_entries[] = {
@@ -285,6 +304,8 @@ static void zathura_page_widget_dispose(GObject* object) {
   g_clear_object(&priv->render_request);
   g_clear_pointer(&priv->image_popover, gtk_widget_unparent);
   g_clear_object(&priv->image_actions);
+  g_clear_handle_id(&priv->link_preview.timeout_id, g_source_remove);
+  g_clear_object(&priv->link_preview.widget);
   g_clear_pointer(&priv->drawing_area, gtk_widget_unparent);
 
   G_OBJECT_CLASS(zathura_page_widget_parent_class)->dispose(object);
@@ -852,6 +873,9 @@ void zathura_page_widget_update_surface(ZathuraPageWidget* widget, cairo_surface
   }
   bool new_render = (priv->surface == NULL && priv->thumbnail == NULL);
 
+  /* zoom or recolor changes re-render the page, so a cached link preview is outdated as well */
+  g_clear_object(&priv->link_preview.widget);
+
   if (priv->surface != NULL) {
     cairo_surface_destroy(priv->surface);
     priv->surface = NULL;
@@ -1163,6 +1187,15 @@ static zathura_rectangle_t next_selection_rectangle(double basepoint_x, double b
   return rect;
 }
 
+/* drop the preview and its pending render unless they belong to link */
+static void link_preview_reset(ZathuraPageWidgetPrivate* priv, zathura_link_t* link) {
+  if (priv->link_preview.link != link) {
+    priv->link_preview.link = NULL;
+    g_clear_object(&priv->link_preview.widget);
+    g_clear_handle_id(&priv->link_preview.timeout_id, g_source_remove);
+  }
+}
+
 static void cb_zathura_page_widget_motion_notify(GtkEventControllerMotion* controller, gdouble ex, gdouble ey,
                                                  gpointer data) {
   GtkWidget* widget              = GTK_WIDGET(data);
@@ -1204,7 +1237,10 @@ static void cb_zathura_page_widget_motion_notify(GtkEventControllerMotion* contr
       }
     }
   } else {
-    const bool over_link = link_at_position(priv, ex, ey) != NULL;
+    zathura_link_t* link = link_at_position(priv, ex, ey);
+    link_preview_reset(priv, link);
+
+    const bool over_link = link != NULL;
     if (priv->mouse.over_link != over_link) {
       if (over_link == true) {
         g_signal_emit(page, signals[ENTER_LINK], 0);
@@ -1230,6 +1266,153 @@ static void cb_zathura_page_widget_leave_notify(GtkEventControllerMotion* UNUSED
   if (priv->mouse.over_link == true) {
     g_signal_emit(page, signals[LEAVE_LINK], 0);
     priv->mouse.over_link = false;
+  }
+
+  link_preview_reset(priv, NULL);
+}
+
+/* time in ms the pointer has to stop on a link before its target is rendered */
+#define LINK_PREVIEW_DELAY 150
+
+static void cb_link_preview_draw(GtkDrawingArea* UNUSED(area), cairo_t* cairo, int UNUSED(width), int UNUSED(height),
+                                 gpointer data) {
+  cairo_set_source_surface(cairo, data, 0, 0);
+  cairo_paint(cairo);
+}
+
+/* start of a crop window of size device pixels that shows pos with a margin */
+static int preview_offset(double pos, int margin, int size, int page_size) {
+  return pos >= 0 ? (int)round(CLAMP(pos - margin, 0, page_size - size)) : 0;
+}
+
+/* largest preview that fits in the window */
+static void link_preview_limits(GtkWidget* widget, int* max_width, int* max_height) {
+  GtkWidget* root = GTK_WIDGET(gtk_widget_get_root(widget));
+  *max_width      = root != NULL ? gtk_widget_get_width(root) * 0.8 : 0;
+  *max_height     = root != NULL ? gtk_widget_get_height(root) / 2 : 0;
+}
+
+/* copy a strip of the link's target page at the current zoom, starting just above the target position */
+static GtkWidget* link_preview_new(zathura_t* zathura, zathura_link_t* link, int max_width, int max_height) {
+  const zathura_link_target_t target = zathura_link_get_target(link);
+  zathura_document_t* document       = zathura_get_document(zathura);
+  if (target.destination_type == ZATHURA_LINK_DESTINATION_UNKNOWN ||
+      target.page_number >= zathura_document_get_number_of_pages(document)) {
+    return NULL;
+  }
+
+  zathura_page_t* page     = zathura_document_get_page(document, target.page_number);
+  unsigned int page_width  = 0;
+  unsigned int page_height = 0;
+  const double scale       = page_calc_height_width(document, page, &page_height, &page_width, false);
+  if (page_width == 0) {
+    return NULL;
+  }
+
+  /* show the whole page width, rendered smaller than the current zoom if it does not fit the window */
+  const double fit          = MIN(1.0, (double)max_width / page_width);
+  cairo_surface_t* rendered = zathura_renderer_render_page_scaled(zathura->sync.render_thread, page, fit);
+  if (rendered == NULL) {
+    return NULL;
+  }
+
+  /* crop only vertically, in device pixels of the rendered page so that the copy is 1:1 */
+  double scale_x = 1;
+  double scale_y = 1;
+  cairo_surface_get_device_scale(rendered, &scale_x, &scale_y);
+  const int surface_width  = cairo_image_surface_get_width(rendered);
+  const int surface_height = cairo_image_surface_get_height(rendered);
+  const int strip_height   = MIN(surface_height, round(max_height * scale_y));
+  const int width          = ceil(surface_width / scale_x);
+  const int height         = ceil(strip_height / scale_y);
+  const int top = preview_offset(target.top * scale * fit * scale_y, strip_height / 10, strip_height, surface_height);
+
+  cairo_surface_t* strip = NULL;
+  if (surface_width > 0 && strip_height > 0) {
+    strip = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, surface_width, strip_height);
+    cairo_surface_set_device_scale(strip, scale_x, scale_y);
+    cairo_t* cairo = cairo_create(strip);
+    cairo_set_source_surface(cairo, rendered, 0, -top / scale_y);
+    cairo_paint(cairo);
+    cairo_destroy(cairo);
+  }
+  cairo_surface_destroy(rendered);
+
+  if (strip == NULL || cairo_surface_status(strip) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy(strip);
+    return NULL;
+  }
+
+  GtkWidget* area = gtk_drawing_area_new();
+  gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(area), width);
+  gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(area), height);
+  gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(area), cb_link_preview_draw, strip,
+                                 (GDestroyNotify)cairo_surface_destroy);
+  return g_object_ref_sink(area);
+}
+
+static gboolean cb_link_preview_timeout(gpointer data) {
+  GtkWidget* widget              = GTK_WIDGET(data);
+  ZathuraPageWidgetPrivate* priv = zathura_page_widget_get_instance_private(ZATHURA_PAGE_WIDGET(widget));
+  priv->link_preview.timeout_id  = 0;
+
+  priv->link_preview.widget = link_preview_new(priv->zathura, priv->link_preview.link, priv->link_preview.max_width,
+                                               priv->link_preview.max_height);
+  if (priv->link_preview.widget != NULL) {
+    gtk_widget_trigger_tooltip_query(widget);
+  }
+
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean cb_zathura_page_widget_query_tooltip(GtkWidget* widget, int x, int y, gboolean UNUSED(keyboard_mode),
+                                                     GtkTooltip* tooltip, gpointer UNUSED(data)) {
+  ZathuraPageWidgetPrivate* priv = zathura_page_widget_get_instance_private(ZATHURA_PAGE_WIDGET(widget));
+
+  bool link_preview = true;
+  girara_setting_get(priv->zathura->ui.session, "link-preview", &link_preview);
+  if (link_preview == false) {
+    return FALSE;
+  }
+
+  zathura_link_t* link = link_at_position(priv, x, y);
+  if (link == NULL) {
+    return FALSE;
+  }
+
+  const zathura_rectangle_t rect = recalc_rectangle(priv->page, zathura_link_get_position(link));
+  const GdkRectangle area        = {rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1};
+  gtk_tooltip_set_tip_area(tooltip, &area);
+
+  switch (zathura_link_get_type(link)) {
+  case ZATHURA_LINK_GOTO_DEST:
+    link_preview_reset(priv, link);
+
+    int max_width  = 0;
+    int max_height = 0;
+    link_preview_limits(widget, &max_width, &max_height);
+    if (max_width != priv->link_preview.max_width || max_height != priv->link_preview.max_height) {
+      /* the window was resized */
+      g_clear_object(&priv->link_preview.widget);
+      priv->link_preview.max_width  = max_width;
+      priv->link_preview.max_height = max_height;
+    }
+
+    if (priv->link_preview.widget == NULL) {
+      /* GTK queries tooltips on every motion, so only render once the pointer has stopped on the link */
+      g_clear_handle_id(&priv->link_preview.timeout_id, g_source_remove);
+      priv->link_preview.link       = link;
+      priv->link_preview.timeout_id = g_timeout_add(LINK_PREVIEW_DELAY, cb_link_preview_timeout, widget);
+      return FALSE;
+    }
+    gtk_tooltip_set_custom(tooltip, priv->link_preview.widget);
+    return TRUE;
+  case ZATHURA_LINK_GOTO_REMOTE:
+  case ZATHURA_LINK_URI:
+    gtk_tooltip_set_text(tooltip, zathura_link_get_target(link).value);
+    return TRUE;
+  default:
+    return FALSE;
   }
 }
 
